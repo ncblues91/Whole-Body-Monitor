@@ -1,2 +1,406 @@
-Flask
-pandas
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+# ---------- BASIC APP CONFIG ----------
+st.set_page_config(
+    page_title="Galaxy Watch 8 Athlete Dashboard",
+    layout="wide",
+)
+
+st.title("Galaxy Watch 8 – Role-Based Health & Performance Dashboard")
+
+# ---------- FILE UPLOAD ----------
+uploaded_file = st.file_uploader(
+    "Upload Galaxy Watch CSV (export from Samsung Health)",
+    type="csv",
+)
+
+if uploaded_file is None:
+    st.info("Upload a CSV file to get started.")
+    st.stop()
+
+df = pd.read_csv(uploaded_file)
+
+# ---------- BASIC CLEANUP ----------
+# Try to parse a timestamp column
+time_col_candidates = ["timestamp", "time", "datetime", "DateTime", "date_time"]
+time_col = None
+for c in time_col_candidates:
+    if c in df.columns:
+        time_col = c
+        break
+
+if time_col is None:
+    st.error(
+        "No timestamp column found. Please add a column named 'timestamp' (or "
+        "'time' / 'datetime') in your CSV."
+    )
+    st.stop()
+
+df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+df = df.dropna(subset=[time_col])
+df = df.sort_values(time_col)
+df["date"] = df[time_col].dt.date
+
+# Helper to check if a column exists
+def col_exists(col_name: str) -> bool:
+    return col_name in df.columns
+
+# ---------- SIDEBAR: ROLE SELECTION ----------
+st.sidebar.header("Settings")
+role = st.sidebar.radio(
+    "Select view",
+    ["Coach", "Trainer", "Team Doctor", "Athlete"],
+)
+
+
+# ---------- COMMON HELPER BLOCKS ----------
+def show_missing_columns(required_cols, label="metrics"):
+    missing = [c for c in required_cols if not col_exists(c)]
+    if missing:
+        st.warning(f"Missing {label}: {', '.join(missing)}")
+    return missing
+
+
+def daily_summary():
+    """
+    Aggregate key metrics per day where possible.
+    """
+    agg_dict = {}
+    if col_exists("steps"):
+        agg_dict["steps"] = "sum"
+    if col_exists("calories"):
+        agg_dict["calories"] = "sum"
+    if col_exists("active_minutes"):
+        agg_dict["active_minutes"] = "sum"
+    if col_exists("heart_rate"):
+        agg_dict["avg_heart_rate"] = ("heart_rate", "mean")
+    if col_exists("stress_level"):
+        agg_dict["avg_stress"] = ("stress_level", "mean")
+    if col_exists("energy_score"):
+        agg_dict["avg_energy_score"] = ("energy_score", "mean")
+    if col_exists("spo2"):
+        agg_dict["min_spo2"] = ("spo2", "min")
+
+    if not agg_dict:
+        return None
+
+    # Support new pandas named aggregation syntax
+    simple_cols = [k for k, v in agg_dict.items() if isinstance(v, str)]
+    named_cols = {k: v for k, v in agg_dict.items() if isinstance(v, tuple)}
+
+    agg_input = {}
+    for c in simple_cols:
+        agg_input[c] = agg_dict[c]
+
+    if named_cols:
+        # Named aggregations
+        grouped = df.groupby("date").agg(
+            **{name: pd.NamedAgg(column=col, aggfunc=func) for name, (col, func) in named_cols.items()},
+            **{c: col_func for c, col_func in agg_input.items()}
+        )
+    else:
+        grouped = df.groupby("date")[simple_cols].agg(agg_input)
+
+    return grouped.reset_index()
+
+
+# ---------- 1) COACH VIEW ----------
+def coach_view():
+    st.subheader("Coach View – Performance & Readiness")
+
+    needed = ["steps", "calories", "active_minutes", "heart_rate", "stress_level", "sleep_stage", "energy_score"]
+    show_missing_columns(needed, label="coach metrics")
+
+    daily = daily_summary()
+    if daily is not None:
+        c1, c2, c3, c4 = st.columns(4)
+        if "steps" in daily.columns:
+            c1.metric("Avg Steps / Day", f"{int(daily['steps'].mean()):,}")
+        if "calories" in daily.columns:
+            c2.metric("Avg Calories / Day", f"{int(daily['calories'].mean()):,}")
+        if "active_minutes" in daily.columns:
+            c3.metric("Avg Active Minutes / Day", f"{daily['active_minutes'].mean():.1f}")
+        if "avg_energy_score" in daily.columns:
+            c4.metric("Avg Energy Score", f"{daily['avg_energy_score'].mean():.1f}")
+
+        st.markdown("**Training Load & Activity Trend**")
+        if "steps" in daily.columns:
+            st.line_chart(daily.set_index("date")[["steps"]], use_container_width=True)
+        if "active_minutes" in daily.columns:
+            st.line_chart(daily.set_index("date")[["active_minutes"]], use_container_width=True)
+
+        st.markdown("**Stress & Recovery Indicators**")
+        hr_cols = [c for c in daily.columns if "heart_rate" in c or "avg_heart_rate" in c]
+        if hr_cols:
+            st.line_chart(daily.set_index("date")[hr_cols], use_container_width=True)
+        if "avg_stress" in daily.columns:
+            st.line_chart(daily.set_index("date")[["avg_stress"]], use_container_width=True)
+
+    # Sleep stages distribution
+    if col_exists("sleep_stage"):
+        st.markdown("**Sleep Stage Distribution**")
+        sleep_counts = df["sleep_stage"].value_counts(normalize=True) * 100
+        st.bar_chart(sleep_counts)
+
+    st.caption(
+        "Coach view focuses on training load, activity, stress, and overall readiness trends "
+        "to guide session intensity and recovery planning."
+    )
+
+
+# ---------- 2) TRAINER VIEW ----------
+def trainer_view():
+    st.subheader("Trainer View – Session Detail & Composition")
+
+    needed = [
+        "steps",
+        "calories",
+        "active_minutes",
+        "heart_rate",
+        "spo2",
+        "stress_level",
+        "body_fat_percent",
+        "skeletal_muscle_percent",
+        "energy_score",
+    ]
+    show_missing_columns(needed, label="trainer metrics")
+
+    daily = daily_summary()
+    if daily is not None:
+        c1, c2, c3, c4 = st.columns(4)
+        if "steps" in daily.columns:
+            c1.metric("Total Steps (Period)", f"{int(daily['steps'].sum()):,}")
+        if "calories" in daily.columns:
+            c2.metric("Total Calories (Period)", f"{int(daily['calories'].sum()):,}")
+        if "active_minutes" in daily.columns:
+            c3.metric("Total Active Minutes", f"{int(daily['active_minutes'].sum()):,}")
+        if "avg_energy_score" in daily.columns:
+            c4.metric("Energy Score (Last Day)", f"{daily['avg_energy_score'].iloc[-1]:.1f}")
+
+    # Heart rate detail
+    if col_exists("heart_rate"):
+        st.markdown("**Heart Rate Over Time**")
+        st.line_chart(df.set_index(time_col)[["heart_rate"]], use_container_width=True)
+
+    # SpO2 and stress
+    cols = st.columns(2)
+    if col_exists("spo2"):
+        with cols[0]:
+            st.markdown("**Blood Oxygen (SpO2)**")
+            st.line_chart(df.set_index(time_col)[["spo2"]], use_container_width=True)
+    if col_exists("stress_level"):
+        with cols[1]:
+            st.markdown("**Stress Level Over Time**")
+            st.line_chart(df.set_index(time_col)[["stress_level"]], use_container_width=True)
+
+    # Body composition
+    if col_exists("body_fat_percent") or col_exists("skeletal_muscle_percent"):
+        st.markdown("**Body Composition**")
+        comp_cols = []
+        if col_exists("body_fat_percent"):
+            comp_cols.append("body_fat_percent")
+        if col_exists("skeletal_muscle_percent"):
+            comp_cols.append("skeletal_muscle_percent")
+
+        # Last known values
+        last_values = df[comp_cols].dropna().iloc[-1]
+        c1, c2 = st.columns(2)
+        if "body_fat_percent" in last_values:
+            c1.metric("Body Fat %", f"{last_values['body_fat_percent']:.1f}%")
+        if "skeletal_muscle_percent" in last_values:
+            c2.metric("Skeletal Muscle %", f"{last_values['skeletal_muscle_percent']:.1f}%")
+
+        st.line_chart(df.set_index(time_col)[comp_cols], use_container_width=True)
+
+    st.caption(
+        "Trainer view emphasizes training volume, intensity (heart rate), "
+        "body composition, and SpO2 to drive programming decisions."
+    )
+
+
+# ---------- 3) TEAM DOCTOR VIEW ----------
+def doctor_view():
+    st.subheader("Team Doctor View – Safety & Clinical Flags")
+
+    needed = [
+        "heart_rate",
+        "ecg",
+        "spo2",
+        "sleep_apnea_events",
+        "systolic_bp",
+        "diastolic_bp",
+        "fall_detected",
+        "antioxidant_index",
+        "stress_level",
+    ]
+    show_missing_columns(needed, label="doctor metrics")
+
+    alert_msgs = []
+
+    # Simple risk heuristics (tunable)
+    if col_exists("heart_rate"):
+        max_hr = df["heart_rate"].max()
+        if max_hr > 190:
+            alert_msgs.append(f"Peak heart rate is very high: {max_hr:.0f} bpm.")
+        elif max_hr > 170:
+            alert_msgs.append(f"Peak heart rate is elevated: {max_hr:.0f} bpm.")
+
+    if col_exists("spo2"):
+        min_spo2 = df["spo2"].min()
+        if min_spo2 < 90:
+            alert_msgs.append(f"Lowest SpO2 is concerning: {min_spo2:.0f}%.")
+        elif min_spo2 < 94:
+            alert_msgs.append(f"Lowest SpO2 is borderline: {min_spo2:.0f}%.")
+
+    if col_exists("systolic_bp") and col_exists("diastolic_bp"):
+        max_sys = df["systolic_bp"].max()
+        max_dia = df["diastolic_bp"].max()
+        if max_sys >= 140 or max_dia >= 90:
+            alert_msgs.append(
+                f"Blood pressure episodes in hypertensive range – "
+                f"max recorded {max_sys:.0f}/{max_dia:.0f} mmHg."
+            )
+
+    if col_exists("sleep_apnea_events"):
+        apnea_per_night = df.groupby("date")["sleep_apnea_events"].sum()
+        if (apnea_per_night > 5).any():
+            alert_msgs.append(
+                "Sleep apnea events > 5 per night on some days – consider further evaluation."
+            )
+
+    if col_exists("fall_detected"):
+        num_falls = df["fall_detected"].fillna(0).astype(int).sum()
+        if num_falls > 0:
+            alert_msgs.append(f"{num_falls} fall detection event(s) recorded.")
+
+    if col_exists("antioxidant_index"):
+        mean_antiox = df["antioxidant_index"].mean()
+        if mean_antiox < 40:
+            alert_msgs.append(
+                f"Average antioxidant index is low ({mean_antiox:.1f}) – nutritional factors may be relevant."
+            )
+
+    if col_exists("stress_level"):
+        mean_stress = df["stress_level"].mean()
+        if mean_stress > 70:
+            alert_msgs.append(
+                f"Average stress level is high ({mean_stress:.1f}) – check for overtraining or psychosocial load."
+            )
+
+    # Alerts display
+    st.markdown("**Clinical Risk Flags (Simple Heuristics)**")
+    if alert_msgs:
+        for msg in alert_msgs:
+            st.error(msg)
+    else:
+        st.success("No major clinical risk flags detected based on simple thresholds.")
+
+    # Detail charts
+    cols = st.columns(2)
+    if col_exists("heart_rate"):
+        with cols[0]:
+            st.markdown("**Heart Rate Timeline**")
+            st.line_chart(df.set_index(time_col)[["heart_rate"]], use_container_width=True)
+    if col_exists("spo2"):
+        with cols[1]:
+            st.markdown("**SpO2 Timeline**")
+            st.line_chart(df.set_index(time_col)[["spo2"]], use_container_width=True)
+
+    cols2 = st.columns(2)
+    if col_exists("systolic_bp") and col_exists("diastolic_bp"):
+        with cols2[0]:
+            st.markdown("**Blood Pressure Trends**")
+            st.line_chart(
+                df.set_index(time_col)[["systolic_bp", "diastolic_bp"]],
+                use_container_width=True,
+            )
+
+    if col_exists("ecg"):
+        with cols2[1]:
+            st.markdown("**ECG Signal (Raw / Summary)**")
+            # Here we just show numeric or categorical ECG as-is
+            st.write(df[[time_col, "ecg"]].tail(50))
+
+    st.caption(
+        "Team doctor view focuses on thresholds and patterns relevant for cardiovascular, "
+        "respiratory, and neuromuscular safety, using watch data as a screening tool only."
+    )
+
+
+# ---------- 4) ATHLETE VIEW ----------
+def athlete_view():
+    st.subheader("Athlete View – Simple Daily Snapshot")
+
+    needed = [
+        "steps",
+        "calories",
+        "active_minutes",
+        "heart_rate",
+        "spo2",
+        "sleep_stage",
+        "energy_score",
+        "stress_level",
+        "menstrual_cycle_phase",
+    ]
+    show_missing_columns(needed, label="athlete metrics")
+
+    daily = daily_summary()
+    if daily is not None and not daily.empty:
+        latest = daily.iloc[-1]
+        st.markdown("**Your Latest Day at a Glance**")
+
+        c1, c2, c3, c4 = st.columns(4)
+        if "steps" in daily.columns:
+            c1.metric("Steps Today", f"{int(latest.get('steps', 0)):,}")
+        if "calories" in daily.columns:
+            c2.metric("Calories Burned", f"{int(latest.get('calories', 0)):,}")
+        if "active_minutes" in daily.columns:
+            c3.metric("Active Minutes", f"{latest.get('active_minutes', 0):.0f}")
+        if "avg_energy_score" in daily.columns:
+            c4.metric("Energy Score", f"{latest.get('avg_energy_score', 0):.1f}")
+
+    # Simple charts
+    cols = st.columns(2)
+    if col_exists("steps"):
+        with cols[0]:
+            st.markdown("**Steps Trend**")
+            st.line_chart(daily.set_index("date")[["steps"]], use_container_width=True)
+    if col_exists("heart_rate"):
+        with cols[1]:
+            st.markdown("**Heart Rate Today**")
+            st.line_chart(df.set_index(time_col)[["heart_rate"]].last("1D"), use_container_width=True)
+
+    # Sleep information
+    if col_exists("sleep_stage"):
+        st.markdown("**Sleep Stages (All Nights)**")
+        sleep_counts = df["sleep_stage"].value_counts(normalize=True) * 100
+        st.bar_chart(sleep_counts)
+
+    # Menstrual cycle, if applicable
+    if col_exists("menstrual_cycle_phase"):
+        st.markdown("**Current Menstrual Cycle Phase**")
+        last_phase = df["menstrual_cycle_phase"].dropna().iloc[-1]
+        st.info(f"Most recent recorded phase: **{last_phase}**")
+
+    # Stress & mood
+    if col_exists("stress_level"):
+        st.markdown("**Stress Today**")
+        st.line_chart(df.set_index(time_col)[["stress_level"]].last("1D"), use_container_width=True)
+
+    st.caption(
+        "Athlete view is kept simple: focus on what you did today, how you slept, "
+        "and how ready you are to perform tomorrow."
+    )
+
+
+# ---------- ROUTING ----------
+if role == "Coach":
+    coach_view()
+elif role == "Trainer":
+    trainer_view()
+elif role == "Team Doctor":
+    doctor_view()
+else:
+    athlete_view()
